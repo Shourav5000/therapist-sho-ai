@@ -637,7 +637,11 @@ body.light { --bg:#f0f4f0; --s1:#e8ede8; --s2:#dde5dd; --b1:rgba(60,100,70,0.1);
 'use strict';
 
 // ── State ──
-let API = window.location.origin.includes('localhost') ? 'http://localhost:5000' : window.location.origin;
+// Auto-detect: use Render URL in production, localhost in dev
+let API = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+  ? 'http://localhost:5000'
+  : window.location.origin;
+console.log('API URL:', API);
 let SID = 'session_001';
 let chatHistory = [];
 let busy = false;
@@ -1123,7 +1127,7 @@ async function sendMsg() {
     }
   } catch(e) {
     rmTyping();
-    addMsg('a','Having trouble connecting to '+API+'. Make sure the server is running. 💚');
+    addMsg('a','Having trouble connecting. Please refresh the page and try again. 💚 ('+API+')');
   }
   busy=false; document.getElementById('sndBtn').disabled=false; inp.focus();
 }
