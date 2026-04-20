@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory
 from flask_cors import CORS
 import os
 import json
@@ -14,11 +14,11 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
 
-# RAG
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
+# RAG - using lightweight TF-IDF instead of HuggingFace to save memory
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
 
 # Typing
 from typing import TypedDict, Annotated, List
@@ -27,14 +27,21 @@ import tempfile
 
 load_dotenv()
 
-app = Flask(__name__)
+# Serve static files from the same directory
+app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
 print("🌿 Starting Therapist@Sho.ai...")
 
 # ─────────────────────────────────────────────────────────────
+# Serve frontend
+# ─────────────────────────────────────────────────────────────
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+# ─────────────────────────────────────────────────────────────
 # LLM — Claude via LangChain
-# FIXED: updated model string to claude-sonnet-4-5
 # ─────────────────────────────────────────────────────────────
 llm = ChatAnthropic(
     model="claude-sonnet-4-5",
@@ -43,7 +50,6 @@ llm = ChatAnthropic(
     streaming=True
 )
 
-# Quick LLM for fast tasks (sentiment, insights)
 quick_llm = ChatAnthropic(
     model="claude-sonnet-4-5",
     anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),
@@ -51,7 +57,7 @@ quick_llm = ChatAnthropic(
 )
 
 # ─────────────────────────────────────────────────────────────
-# SENTIMENT — Claude-powered (no PyTorch needed)
+# SENTIMENT
 # ─────────────────────────────────────────────────────────────
 EMOTION_MAP = {
     "joy":      {"label": "Happy",     "emoji": "😊", "tone": "celebratory and warm"},
@@ -64,7 +70,6 @@ EMOTION_MAP = {
 }
 
 def detect_emotion(text: str) -> str:
-    """Use Claude to detect emotion — no PyTorch needed"""
     try:
         prompt = f"""Classify the primary emotion in this message into exactly one word.
 Choose from: joy, sadness, anger, fear, surprise, disgust, neutral
@@ -77,19 +82,15 @@ Respond with only one word, lowercase."""
         return "neutral"
 
 # ─────────────────────────────────────────────────────────────
-# RAG — HuggingFace Embeddings + ChromaDB
+# RAG
 # ─────────────────────────────────────────────────────────────
-print("📚 Loading embeddings model...")
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"}
-)
-
+print("📚 Setting up lightweight text search...")
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-session_stores = {}
+# Lightweight in-memory RAG: stores raw chunks + TF-IDF per session
+session_stores = {}  # session_id -> {"chunks": [...], "vectorizer": TfidfVectorizer, "matrix": np.array}
 
 # ─────────────────────────────────────────────────────────────
-# LANGCHAIN MEMORY — per session
+# MEMORY
 # ─────────────────────────────────────────────────────────────
 session_memories = {}
 
@@ -99,34 +100,32 @@ def get_memory(session_id: str) -> ChatMessageHistory:
     return session_memories[session_id]
 
 # ─────────────────────────────────────────────────────────────
-# LANGGRAPH TOOLS
+# TOOLS
 # ─────────────────────────────────────────────────────────────
 @tool
 def get_breathing_exercise(technique: str = "box") -> str:
     """Suggest a breathing exercise. Use when user is anxious, stressed, or overwhelmed.
     Options: box, 478, equal"""
     exercises = {
-        "box":   "**Box Breathing (4-4-4-4):** Inhale 4 → Hold 4 → Exhale 4 → Hold 4. Repeat 4 times. Perfect for anxiety and stress.",
-        "478":   "**4-7-8 Breathing:** Inhale 4 → Hold 7 → Exhale 8. Activates your parasympathetic nervous system for deep calm.",
-        "equal": "**Equal Breathing (5-5):** Inhale 5 → Exhale 5. Simple and effective — great for beginners.",
+        "box":   "**Box Breathing (4-4-4-4):** Inhale 4 → Hold 4 → Exhale 4 → Hold 4. Repeat 4 times.",
+        "478":   "**4-7-8 Breathing:** Inhale 4 → Hold 7 → Exhale 8. Activates your parasympathetic nervous system.",
+        "equal": "**Equal Breathing (5-5):** Inhale 5 → Exhale 5. Simple and grounding.",
     }
     return exercises.get(technique, exercises["box"])
-
 
 @tool
 def get_coping_strategies(issue: str) -> str:
     """Provide evidence-based coping strategies. Options: anxiety, depression, stress, anger, grief, loneliness, trauma"""
     strategies = {
-        "anxiety":    "**For Anxiety:** 1) 5-4-3-2-1 grounding technique 2) Progressive muscle relaxation 3) Limit caffeine 4) Challenge anxious thoughts — ask 'Is this realistic?'",
-        "depression": "**For Depression:** 1) Schedule one small enjoyable activity daily 2) Maintain routine 3) Reach out to one person today 4) Even a 10-min walk can shift mood",
-        "stress":     "**For Stress:** 1) Time-box worries to 15 min/day 2) Break tasks into tiny steps 3) Practice saying no 4) Take micro-breaks every 90 minutes",
-        "anger":      "**For Anger:** 1) STOP: Stop, Take a breath, Observe, Proceed 2) Physical release like a walk 3) Write an unsent letter 4) Find the hurt beneath the anger",
-        "grief":      "**For Grief:** 1) Allow yourself to feel — no timeline 2) Create a ritual to honor your loss 3) Connect with others who understand 4) Be gentle on hard days",
-        "loneliness": "**For Loneliness:** 1) Text one person today 2) Join a group around an interest 3) Volunteer — helping reduces isolation 4) Practice self-compassion",
-        "trauma":     "**For Trauma:** 1) Ground yourself with your senses 2) Create safety routines 3) Consider EMDR or CPT therapy 4) Be patient with your nervous system",
+        "anxiety":    "**For Anxiety:** 1) 5-4-3-2-1 grounding 2) Progressive muscle relaxation 3) Limit caffeine 4) Challenge anxious thoughts",
+        "depression": "**For Depression:** 1) Schedule one enjoyable activity daily 2) Maintain routine 3) Reach out to one person today 4) Even a 10-min walk helps",
+        "stress":     "**For Stress:** 1) Time-box worries to 15 min/day 2) Break tasks into tiny steps 3) Practice saying no 4) Take micro-breaks",
+        "anger":      "**For Anger:** 1) STOP technique 2) Physical release like a walk 3) Write an unsent letter 4) Find the hurt beneath the anger",
+        "grief":      "**For Grief:** 1) Allow yourself to feel 2) Create a ritual to honor your loss 3) Connect with others 4) Be gentle on hard days",
+        "loneliness": "**For Loneliness:** 1) Text one person today 2) Join a group around an interest 3) Volunteer 4) Practice self-compassion",
+        "trauma":     "**For Trauma:** 1) Ground yourself with your senses 2) Create safety routines 3) Consider EMDR or CPT therapy 4) Be patient with yourself",
     }
     return strategies.get(issue.lower(), f"For {issue}: Focus on self-compassion, grounding, and reaching out for support.")
-
 
 @tool
 def check_crisis_level(message: str) -> str:
@@ -142,17 +141,28 @@ def check_crisis_level(message: str) -> str:
 Strongly encourage the user to reach out to a trusted person or professional right now."""
     return "No immediate crisis detected. Continue supportive conversation."
 
-
 @tool
 def search_journal_context(query: str, session_id: str = "default") -> str:
-    """Search user's uploaded journal for relevant context. Use when user references past events."""
+    """Search user's uploaded journal for relevant context."""
     if session_id not in session_stores:
         return "No journal entries uploaded yet for this session."
-    docs = session_stores[session_id].similarity_search(query, k=3)
-    if not docs:
-        return "No relevant journal entries found."
-    return "Relevant journal context:\n\n" + "\n\n".join([f"• {d.page_content}" for d in docs])
-
+    store = session_stores[session_id]
+    chunks = store["chunks"]
+    if not chunks:
+        return "No journal entries found."
+    try:
+        vectorizer = store["vectorizer"]
+        matrix = store["matrix"]
+        q_vec = vectorizer.transform([query])
+        # cosine similarity
+        scores = (matrix * q_vec.T).toarray().flatten()
+        top_idx = scores.argsort()[-3:][::-1]
+        results = [chunks[i] for i in top_idx if scores[i] > 0]
+        if not results:
+            return "No relevant journal entries found."
+        return "Relevant journal context:\n\n" + "\n\n".join([f"• {r}" for r in results])
+    except Exception as e:
+        return f"Search error: {str(e)}"
 
 # ─────────────────────────────────────────────────────────────
 # LANGGRAPH AGENT
@@ -227,6 +237,7 @@ def chat():
     data = request.json
     messages = data.get("messages", [])
     session_id = data.get("session_id", "default")
+    images = data.get("images", [])
 
     if not messages:
         return jsonify({"error": "No messages provided"}), 400
@@ -235,12 +246,8 @@ def chat():
         (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
     )
 
-    # Claude-powered sentiment analysis
     emotion = detect_emotion(last_user_msg)
     emotion_info = EMOTION_MAP.get(emotion, EMOTION_MAP["neutral"])
-
-    # Handle images attached to latest user message
-    images = data.get("images", [])  # [{base64, mimeType}]
 
     # Build LangChain messages
     lc_messages = []
@@ -258,7 +265,7 @@ def chat():
                             "data": img["base64"]
                         }
                     })
-                content.append({"type": "text", "text": m["content"] or "Please look at this image and share your thoughts about what you see."})
+                content.append({"type": "text", "text": m["content"] or "Please look at this image."})
                 lc_messages.append(HumanMessage(content=content))
             else:
                 lc_messages.append(HumanMessage(content=m["content"]))
@@ -266,7 +273,6 @@ def chat():
             lc_messages.append(AIMessage(content=m["content"]))
 
     def generate():
-        # Send emotion data first so frontend can display it
         yield f"data: {json.dumps({'emotion': emotion, 'emotion_label': emotion_info['label'], 'emotion_emoji': emotion_info['emoji']})}\n\n"
 
         try:
@@ -276,8 +282,7 @@ def chat():
             for chunk in agent_graph.stream(state, stream_mode="values"):
                 if "messages" in chunk:
                     last_msg = chunk["messages"][-1]
-                    # Skip tool messages and user messages — only stream final AI text
-                    from langchain_core.messages import AIMessage as LCAIMessage, ToolMessage
+                    from langchain_core.messages import AIMessage as LCAIMessage
                     if not isinstance(last_msg, LCAIMessage):
                         continue
                     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
@@ -285,14 +290,13 @@ def chat():
                     if hasattr(last_msg, "content") and last_msg.content:
                         content = last_msg.content
                         if isinstance(content, list):
-                            content = " ".join(c.get("text","") for c in content if isinstance(c, dict))
+                            content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
                         if content and content != final_response:
                             new_text = content[len(final_response):]
                             if new_text:
                                 final_response = content
                                 yield f"data: {json.dumps({'text': new_text})}\n\n"
 
-            # Save to LangChain memory
             memory = get_memory(session_id)
             memory.add_user_message(last_user_msg)
             memory.add_ai_message(final_response)
@@ -311,7 +315,6 @@ def chat():
 
 @app.route("/upload-journal", methods=["POST"])
 def upload_journal():
-    """RAG: Upload a PDF or TXT journal for the therapist to reference"""
     session_id = request.form.get("session_id", "default")
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -330,21 +333,24 @@ def upload_journal():
         loader = PyPDFLoader(tmp_path) if suffix == ".pdf" else TextLoader(tmp_path, encoding="utf-8")
         documents = loader.load()
         chunks = text_splitter.split_documents(documents)
+        chunk_texts = [c.page_content for c in chunks]
 
-        if session_id in session_stores:
-            session_stores[session_id].add_documents(chunks)
-        else:
-            session_stores[session_id] = Chroma.from_documents(
-                documents=chunks,
-                embedding=embeddings,
-                collection_name=f"journal_{session_id}"
-            )
+        # Build TF-IDF index (very lightweight, no GPU needed)
+        existing = session_stores.get(session_id, {}).get("chunks", [])
+        all_chunks = existing + chunk_texts
+        vectorizer = TfidfVectorizer(stop_words="english", max_features=5000)
+        matrix = vectorizer.fit_transform(all_chunks)
+        session_stores[session_id] = {
+            "chunks": all_chunks,
+            "vectorizer": vectorizer,
+            "matrix": matrix
+        }
 
         os.unlink(tmp_path)
         return jsonify({
             "success": True,
-            "chunks": len(chunks),
-            "message": f"Processed {len(chunks)} sections from your journal 💚"
+            "chunks": len(chunk_texts),
+            "message": f"Processed {len(chunk_texts)} sections from your journal 💚"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -357,11 +363,7 @@ def analyze_sentiment():
         return jsonify({"error": "No text provided"}), 400
     emotion = detect_emotion(text)
     info = EMOTION_MAP.get(emotion, EMOTION_MAP["neutral"])
-    return jsonify({
-        "emotion": emotion,
-        "label": info["label"],
-        "emoji": info["emoji"]
-    })
+    return jsonify({"emotion": emotion, "label": info["label"], "emoji": info["emoji"]})
 
 
 @app.route("/mood-insight", methods=["POST"])
