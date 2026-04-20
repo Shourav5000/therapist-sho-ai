@@ -563,7 +563,7 @@ body.light { --bg:#f0f4f0; --s1:#e8ede8; --s2:#dde5dd; --b1:rgba(60,100,70,0.1);
   <div class="modal">
     <h3>⚙ Settings</h3>
     <p>Configure your Flask backend connection.</p>
-    <div class="fg"><label>Backend URL</label><input id="cfgUrl" value="http://localhost:5000"/></div>
+    <div class="fg"><label>Backend URL</label><input id="cfgUrl" id="cfgUrl" value="http://localhost:5000"/></div>
     <div class="fg"><label>Session ID</label><input id="cfgSid" value="session_001"/></div>
     <button class="btn-p" onclick="saveCfg()">Save & Connect</button>
     <button class="btn-s" onclick="closeModal('cfgModal')">Cancel</button>
@@ -637,7 +637,7 @@ body.light { --bg:#f0f4f0; --s1:#e8ede8; --s2:#dde5dd; --b1:rgba(60,100,70,0.1);
 'use strict';
 
 // ── State ──
-let API = 'http://localhost:5000';
+let API = window.location.origin.includes('localhost') ? 'http://localhost:5000' : window.location.origin;
 let SID = 'session_001';
 let chatHistory = [];
 let busy = false;
